@@ -80,6 +80,12 @@ def _extract_zip(uploaded, tmp_dir: str) -> str:
     os.makedirs(shp_dir, exist_ok=True)
     with zipfile.ZipFile(zip_path) as z:
         z.extractall(shp_dir)
+    # If the zip contained a single top-level folder, descend into it
+    entries = [e for e in os.listdir(shp_dir) if not e.startswith(".")]
+    if len(entries) == 1:
+        candidate = os.path.join(shp_dir, entries[0])
+        if os.path.isdir(candidate):
+            return candidate
     return shp_dir
 
 
