@@ -15,6 +15,7 @@ Implements all comparison checks from the ODOT GIS QAQC spec:
   11. Required shapefile schema fields present
 """
 
+import re
 from typing import Optional
 
 from .models import (
@@ -26,8 +27,21 @@ from .models import (
 )
 
 ACREAGE_TOL = 0.05
+FOOTPRINT_ACREAGE_TOL = 0.10  # looser: reports often round footprint to whole acres
 CROSS_REPORT_ACREAGE_TOL = 0.01
 LINEAR_FEET_TOL = 10.0
+
+# StreamType suffixes that appear in shapefiles but are dropped in reports
+_STREAM_TYPE_STRIP = re.compile(
+    r"\s+(stream|ditch|channel|creek|drain)\s*$", re.IGNORECASE
+)
+
+
+def _norm_stream_type(t: Optional[str]) -> Optional[str]:
+    """'Perennial Stream' → 'Perennial', 'Intermittent Stream' → 'Intermittent'."""
+    if not t:
+        return t
+    return _STREAM_TYPE_STRIP.sub("", t.strip())
 
 
 def _fmt(val: Optional[float], unit: str = "ac") -> str:
@@ -64,11 +78,11 @@ def _check_footprint_acreage(
                 message="Project footprint shapefile not found or empty; cannot compare to WW report.",
                 report_value=_fmt(rpt_ac),
             ))
-        elif _acreage_pass(shp_ac, rpt_ac):
+        elif _acreage_pass(shp_ac, rpt_ac, FOOTPRINT_ACREAGE_TOL):
             findings.append(QCFinding(
                 check_name="Footprint Acreage (WW)",
                 severity=Severity.PASS,
-                message=f"Footprint acreage matches WW report within ±{ACREAGE_TOL} ac.",
+                message=f"Footprint acreage matches WW report within ±{FOOTPRINT_ACREAGE_TOL} ac.",
                 shapefile_value=_fmt(shp_ac),
                 report_value=_fmt(rpt_ac),
             ))
@@ -76,7 +90,7 @@ def _check_footprint_acreage(
             findings.append(QCFinding(
                 check_name="Footprint Acreage (WW)",
                 severity=Severity.FAIL,
-                message=f"Footprint acreage mismatch: diff = {abs(shp_ac - rpt_ac):.4f} ac (tolerance ±{ACREAGE_TOL} ac).",
+                message=f"Footprint acreage mismatch: diff = {abs(shp_ac - rpt_ac):.4f} ac (tolerance ±{FOOTPRINT_ACREAGE_TOL} ac).",
                 shapefile_value=_fmt(shp_ac),
                 report_value=_fmt(rpt_ac),
             ))
@@ -90,11 +104,11 @@ def _check_footprint_acreage(
                 message="Project footprint shapefile not found; cannot compare to BA report.",
                 report_value=_fmt(rpt_ac),
             ))
-        elif _acreage_pass(shp_ac, rpt_ac):
+        elif _acreage_pass(shp_ac, rpt_ac, FOOTPRINT_ACREAGE_TOL):
             findings.append(QCFinding(
                 check_name="Footprint Acreage (BA)",
                 severity=Severity.PASS,
-                message=f"Footprint acreage matches BA report within ±{ACREAGE_TOL} ac.",
+                message=f"Footprint acreage matches BA report within ±{FOOTPRINT_ACREAGE_TOL} ac.",
                 shapefile_value=_fmt(shp_ac),
                 report_value=_fmt(rpt_ac),
             ))
@@ -102,7 +116,7 @@ def _check_footprint_acreage(
             findings.append(QCFinding(
                 check_name="Footprint Acreage (BA)",
                 severity=Severity.FAIL,
-                message=f"Footprint acreage mismatch: diff = {abs(shp_ac - rpt_ac):.4f} ac.",
+                message=f"Footprint acreage mismatch: diff = {abs(shp_ac - rpt_ac):.4f} ac (tolerance ±{FOOTPRINT_ACREAGE_TOL} ac).",
                 shapefile_value=_fmt(shp_ac),
                 report_value=_fmt(rpt_ac),
             ))
@@ -214,9 +228,10 @@ def _check_per_feature_streams(
         if shp_feat is None:
             continue  # Already flagged by label set check
 
-        # Feature type
+        # Feature type — normalize to strip trailing " Stream" / " Ditch" etc.
         if rpt_feat.feature_type and shp_feat.feature_type:
-            if rpt_feat.feature_type.lower().strip() != shp_feat.feature_type.lower().strip():
+            if (_norm_stream_type(rpt_feat.feature_type).lower()
+                    != _norm_stream_type(shp_feat.feature_type).lower()):
                 findings.append(QCFinding(
                     check_name="Stream Feature Type",
                     severity=Severity.FAIL,
@@ -229,7 +244,7 @@ def _check_per_feature_streams(
                 findings.append(QCFinding(
                     check_name="Stream Feature Type",
                     severity=Severity.PASS,
-                    message=f"{label}: feature type matches ({rpt_feat.feature_type}).",
+                    message=f"{label}: feature type matches ({_norm_stream_type(rpt_feat.feature_type)}).",
                     feature_id=label,
                 ))
 
@@ -363,6 +378,21 @@ def _check_per_feature_wetlands(
     return findings
 
 
+_HAB_CATEGORIES = {
+    "bat_forest": ["bat_forest", "tcb", "bat", "indiana", "nleb", "forested", "wooded"],
+    "abb":        ["abb", "burying_beetle", "burying beetle", "native_perennial", "native perennial"],
+    "pollinator": ["pollinator", "milkweed"],
+}
+
+
+def _hab_category(label: str) -> Optional[str]:
+    l = label.lower()
+    for cat, keywords in _HAB_CATEGORIES.items():
+        if any(k in l for k in keywords):
+            return cat
+    return None
+
+
 def _check_habitat_acreage(
     shp: ShapefileData,
     ba: Optional[BAReport],
@@ -371,30 +401,57 @@ def _check_habitat_acreage(
         return []
 
     findings = []
-    shp_by_label = {f.label.lower(): f for f in shp.habitat_features}
-    rpt_by_label = {f.label.lower(): f for f in ba.habitat_features}
 
-    for label, rpt_feat in rpt_by_label.items():
-        shp_feat = shp_by_label.get(label)
-        if shp_feat is None or rpt_feat.acres is None or shp_feat.acres is None:
-            continue
-        if _acreage_pass(shp_feat.acres, rpt_feat.acres):
+    # Group BA features by category, summing acres
+    ba_by_cat: dict[str, float] = {}
+    for feat in ba.habitat_features:
+        cat = _hab_category(feat.label)
+        if cat and feat.acres is not None:
+            ba_by_cat[cat] = ba_by_cat.get(cat, 0.0) + feat.acres
+
+    # Group shapefile features by category, summing acres
+    shp_by_cat: dict[str, float] = {}
+    for feat in shp.habitat_features:
+        cat = _hab_category(feat.label)
+        if cat and feat.acres is not None:
+            shp_by_cat[cat] = shp_by_cat.get(cat, 0.0) + feat.acres
+
+    for cat in sorted(set(list(ba_by_cat) + list(shp_by_cat))):
+        ba_ac = ba_by_cat.get(cat)
+        shp_ac = shp_by_cat.get(cat)
+        if ba_ac is None:
+            findings.append(QCFinding(
+                check_name="Habitat Acreage",
+                severity=Severity.WARN,
+                message=f"{cat}: shapefile has {shp_ac:.4f} ac but no matching BA habitat data.",
+                shapefile_value=_fmt(shp_ac),
+                feature_id=cat,
+            ))
+        elif shp_ac is None:
+            findings.append(QCFinding(
+                check_name="Habitat Acreage",
+                severity=Severity.WARN,
+                message=f"{cat}: BA reports {ba_ac:.4f} ac but no matching shapefile found.",
+                report_value=_fmt(ba_ac),
+                feature_id=cat,
+            ))
+        elif _acreage_pass(shp_ac, ba_ac):
             findings.append(QCFinding(
                 check_name="Habitat Acreage",
                 severity=Severity.PASS,
-                message=f"{label}: acreage matches within ±{ACREAGE_TOL} ac.",
-                shapefile_value=_fmt(shp_feat.acres),
-                report_value=_fmt(rpt_feat.acres),
-                feature_id=label,
+                message=f"{cat}: acreage matches within ±{ACREAGE_TOL} ac.",
+                shapefile_value=_fmt(shp_ac),
+                report_value=_fmt(ba_ac),
+                feature_id=cat,
             ))
         else:
             findings.append(QCFinding(
                 check_name="Habitat Acreage",
                 severity=Severity.FAIL,
-                message=f"{label}: acreage mismatch (diff = {abs(shp_feat.acres - rpt_feat.acres):.4f} ac).",
-                shapefile_value=_fmt(shp_feat.acres),
-                report_value=_fmt(rpt_feat.acres),
-                feature_id=label,
+                message=f"{cat}: acreage mismatch (diff = {abs(shp_ac - ba_ac):.4f} ac).",
+                shapefile_value=_fmt(shp_ac),
+                report_value=_fmt(ba_ac),
+                feature_id=cat,
             ))
 
     return findings
