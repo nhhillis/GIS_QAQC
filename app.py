@@ -30,6 +30,35 @@ st.set_page_config(
 st.title("GIS QAQC")
 st.caption("Cross-check ODOT field shapefiles against Biological Assessment and Waters & Wetlands reports.")
 
+st.markdown("""
+<style>
+/* Primary button (Run QC) */
+div.stButton > button[kind="primary"] {
+    background-color: #CEDC00;
+    color: #1a1a1a;
+    border: none;
+}
+div.stButton > button[kind="primary"]:hover,
+div.stButton > button[kind="primary"]:focus {
+    background-color: #57B847;
+    color: #ffffff;
+    border: none;
+}
+/* Download button */
+div.stDownloadButton > button {
+    background-color: #CEDC00;
+    color: #1a1a1a;
+    border: none;
+}
+div.stDownloadButton > button:hover,
+div.stDownloadButton > button:focus {
+    background-color: #57B847;
+    color: #ffffff;
+    border: none;
+}
+</style>
+""", unsafe_allow_html=True)
+
 # ---------------------------------------------------------------------------
 # Sidebar — file uploads
 # ---------------------------------------------------------------------------
